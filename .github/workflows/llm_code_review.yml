@@ -1,8 +1,5 @@
 name: Code Review with ollama
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
