@@ -25,4 +25,5 @@ jobs:
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OLLAMA_ADDRESS: http://localhost:11434
+          LLM_MODEL: deepseek-r1:1.5b
           exclude: ""
