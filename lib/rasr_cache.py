@@ -13,8 +13,7 @@ import logging
 import mmap
 import numpy
 import os
-import sys
-import typing
+from typing import Dict, List, Optional, Tuple
 import zlib
 from struct import pack, unpack
 
@@ -51,9 +50,10 @@ class FileArchive:
     start_recovery_tag = 0xAA55AA55
     end_recovery_tag = 0x55AA55AA
 
-    def __init__(self, filename, must_exists=False):
+    def __init__(self, filename, must_exists=False, encoding="ascii"):
+        self.encoding = encoding
 
-        self.ft = {}  # type: typing.Dict[str,FileInfo]
+        self.ft: Dict[str, FileInfo] = {}
         if os.path.exists(filename):
             self.allophones = []
             self.f = open(filename, "rb")
@@ -182,12 +182,12 @@ class FileArchive:
         return res
 
     # write routines
-    def write_str(self, s):
+    def write_str(self, s, enc="ascii"):
         """
         :param str s:
         :rtype: int
         """
-        return self.f.write(pack("%ds" % len(s), s.encode("ascii")))
+        return self.f.write(pack("%ds" % len(s.encode(enc)), s.encode(enc)))
 
     def write_char(self, i):
         """
@@ -256,7 +256,7 @@ class FileArchive:
             return
         for i in range(count):
             str_len = self.read_u32()
-            name = self.read_str(str_len)
+            name = self.read_str(str_len, self.encoding)
             pos = self.read_u64()
             size = self.read_u32()
             comp = self.read_u32()
@@ -271,8 +271,8 @@ class FileArchive:
         self.write_u32(len(self.ft))
 
         for fi in self.ft.values():
-            self.write_u32(len(fi.name))
-            self.write_str(fi.name)
+            self.write_u32(len(fi.name.encode(self.encoding)))
+            self.write_str(fi.name, self.encoding)
             self.write_u64(fi.pos)
             self.write_u32(fi.size)
             self.write_u32(fi.compressed)
@@ -293,7 +293,7 @@ class FileArchive:
                 continue
 
             fn_len = self.read_u32()
-            name = self.read_str(fn_len)
+            name = self.read_str(fn_len, self.encoding)
             pos = self.f.tell()
             size = self.read_u32()
             comp = self.read_u32()
@@ -322,22 +322,27 @@ class FileArchive:
         """
 
         if typ == "str":
-            return self.read_str(size)
-
+            return self.read_str(size, self.encoding)
+        elif typ == "bytes":
+            return self.read_bytes(size)
         elif typ == "feat":
             type_len = self.read_U32()
             typ = self.read_str(type_len)
             # print(typ)
-            assert typ == "vector-f32"
+            assert typ in {"vector-f32", "f32"}
             count = self.read_U32()
-            data = [None] * count  # type: typing.List[typing.Optional[numpy.ndarray]]
-            time_ = [None] * count  # type: typing.List[typing.Optional[numpy.ndarray]]
-            for i in range(count):
-                size = self.read_U32()
-                data[i] = self.read_v("f", size)  # size x f32
-                time_[i] = self.read_v("d", 2)  # 2    x f64
+            data: List[Optional[numpy.ndarray]] = [None] * count
+            time_: List[Optional[numpy.ndarray]] = [None] * count
+            if typ == "vector-f32":
+                for i in range(count):
+                    size = self.read_U32()
+                    data[i] = self.read_v("f", size)  # size x f32
+                    time_[i] = self.read_v("d", 2)  # 2    x f64
+            elif typ == "f32":
+                for i in range(count):
+                    data[i] = self.read_v("f", 1)  # 1 x f32
+                    time_[i] = self.read_v("d", 2)  # 2 x f64
             return time_, data
-
         elif typ in ["align", "align_raw"]:
             type_len = self.read_U32()
             file_typ = self.read_str(type_len)
@@ -408,6 +413,8 @@ class FileArchive:
                     return alignment
             else:
                 raise Exception("No valid alignment header found (found: %r). Wrong cache?" % typ)
+        else:
+            raise NotImplementedError(f"Archive type '{typ}' is not yet implemented")
 
     def has_entry(self, filename):
         """
@@ -446,7 +453,7 @@ class FileArchive:
             a = array.array("b")
             a.fromfile(self.f, comp)
             # unpack
-            b = zlib.decompress(a.tostring(), 15 + 32)
+            b = zlib.decompress(a.tobytes(), 15 + 32)
             # substitute self.f by an anonymous memmap file object
             # restore original file handle after we're done
             backup_f = self.f
@@ -496,8 +503,8 @@ class FileArchive:
         :param times:
         """
         self.write_U32(self.start_recovery_tag)
-        self.write_u32(len(filename))
-        self.write_str(filename)
+        self.write_u32(len(filename.encode(self.encoding)))
+        self.write_str(filename, self.encoding)
         pos = self.f.tell()
         if len(features) > 0:
             dim = len(features[0])
@@ -542,8 +549,8 @@ class FileArchive:
         ) % (dim, duration)
         self.write_U32(self.start_recovery_tag)
         filename = "%s.attribs" % filename
-        self.write_u32(len(filename))
-        self.write_str(filename)
+        self.write_u32(len(filename.encode(self.encoding)))
+        self.write_str(filename, self.encoding)
         pos = self.f.tell()
         size = len(data)
         self.write_u32(size)
@@ -559,17 +566,18 @@ class FileArchiveBundle:
     File archive bundle.
     """
 
-    def __init__(self, filename):
+    def __init__(self, filename, encoding="ascii"):
         """
         :param str filename: .bundle file
+        :param str encoding: encoding used in the files
         """
         # filename -> FileArchive
-        self.archives = {}  # type: typing.Dict[str,FileArchive]
+        self.archives: Dict[str, FileArchive] = {}
         # archive content file -> FileArchive
-        self.files = {}  # type: typing.Dict[str,FileArchive]
+        self.files: Dict[str, FileArchive] = {}
         self._short_seg_names = {}
         for line in open(filename).read().splitlines():
-            self.archives[line] = a = FileArchive(line, must_exists=True)
+            self.archives[line] = a = FileArchive(line, must_exists=True, encoding=encoding)
             for f in a.ft.keys():
                 self.files[f] = a
             # noinspection PyProtectedMember
@@ -616,17 +624,18 @@ class FileArchiveBundle:
             a.setAllophones(filename)
 
 
-def open_file_archive(archive_filename, must_exists=True):
+def open_file_archive(archive_filename, must_exists=True, encoding="ascii"):
     """
     :param str archive_filename:
     :param bool must_exists:
+    :param str encoding:
     :rtype: FileArchiveBundle|FileArchive
     """
     if archive_filename.endswith(".bundle"):
         assert must_exists
-        return FileArchiveBundle(archive_filename)
+        return FileArchiveBundle(archive_filename, encoding=encoding)
     else:
-        return FileArchive(archive_filename, must_exists=must_exists)
+        return FileArchive(archive_filename, must_exists=must_exists, encoding=encoding)
 
 
 def is_rasr_cache_file(filename):
@@ -799,7 +808,7 @@ class MixtureSet:
         """
         a = array.array("b")
         a.fromfile(self.f, l)
-        return a.tostring().decode(enc)
+        return a.tobytes().decode(enc)
 
     def read_f32(self):
         """
@@ -919,9 +928,7 @@ class MixtureSet:
             self.densities[n, 1] = cov_idx
 
         self.num_mixtures = self.read_u32()
-        self.mixtures = [
-            None
-        ] * self.num_mixtures  # type: typing.List[typing.Optional[typing.Tuple[typing.List[int],typing.List[float]]]]  # nopep8
+        self.mixtures: List[Optional[Tuple[List[int], List[float]]]] = [None] * self.num_mixtures
         for n in range(self.num_mixtures):
             num_densities = self.read_u32()
             dns_idx = []
@@ -1022,7 +1029,7 @@ class WordBoundaries:
         """
         a = array.array("b")
         a.fromfile(self.f, l)
-        return a.tostring().decode(enc)
+        return a.tobytes().decode(enc)
 
     def __init__(self, filename):
         """

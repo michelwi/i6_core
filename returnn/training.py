@@ -1,11 +1,14 @@
 __all__ = [
-    "ReturnnModel",
+    "AverageTFCheckpointsJob",
+    "AverageTorchCheckpointsJob",
     "Checkpoint",
-    "ReturnnTrainingJob",
-    "ReturnnTrainingFromFileJob",
     "GetBestEpochJob",
     "GetBestTFCheckpointJob",
-    "AverageTFCheckpointsJob",
+    "GetBestPtCheckpointJob",
+    "PtCheckpoint",
+    "ReturnnModel",
+    "ReturnnTrainingFromFileJob",
+    "ReturnnTrainingJob",
 ]
 
 import copy
@@ -14,7 +17,8 @@ import sys
 import os
 import shutil
 import subprocess as sp
-from typing import Dict, List, Optional, Union
+import numpy as np
+from typing import Dict, Sequence, Iterable, List, Optional, Union
 
 from sisyphus import *
 
@@ -71,6 +75,33 @@ class Checkpoint:
     def __repr__(self):
         return "'%s'" % self.ckpt_path
 
+    def exists(self):
+        return os.path.exists(self.index_path.get_path())
+
+
+class PtCheckpoint:
+    """
+    Checkpoint object pointing to a PyTorch checkpoint .pt file
+    """
+
+    def __init__(self, path: tk.Path):
+        """
+        :param path: .pt file
+        """
+        self.path = path
+
+    def _sis_hash(self):
+        return self.path._sis_hash()
+
+    def __str__(self):
+        return self.path.get()
+
+    def __repr__(self):
+        return "'%s'" % self.path
+
+    def exists(self):
+        return os.path.exists(self.path.get_path())
+
 
 class ReturnnTrainingJob(Job):
     """
@@ -89,52 +120,60 @@ class ReturnnTrainingJob(Job):
         function of Returnn not all checkpoints are actually available.
     """
 
+    __sis_hash_exclude__ = {"distributed_launch_cmd": "mpirun"}
+
     def __init__(
         self,
-        returnn_config,
+        returnn_config: ReturnnConfig,
         *,  # args below are keyword only
-        log_verbosity=3,
-        device="gpu",
-        num_epochs=1,
-        save_interval=1,
-        keep_epochs=None,
-        time_rqmt=4,
-        mem_rqmt=4,
-        cpu_rqmt=2,
-        horovod_num_processes=None,
-        multi_node_slots=None,
-        returnn_python_exe=None,
-        returnn_root=None,
+        log_verbosity: int = 3,
+        device: str = "gpu",
+        num_epochs: int = 1,
+        save_interval: int = 1,
+        keep_epochs: Optional[Iterable[int]] = None,
+        time_rqmt: float = 4,
+        mem_rqmt: float = 4,
+        cpu_rqmt: int = 2,
+        distributed_launch_cmd: str = "mpirun",
+        horovod_num_processes: Optional[int] = None,
+        multi_node_slots: Optional[int] = None,
+        returnn_python_exe: Optional[tk.Path] = None,
+        returnn_root: Optional[tk.Path] = None,
     ):
         """
 
-        :param ReturnnConfig returnn_config:
-        :param int log_verbosity: RETURNN log verbosity from 1 (least verbose) to 5 (most verbose)
-        :param str device: "cpu" or "gpu"
-        :param int num_epochs: number of epochs to run, will also set `num_epochs` in the config file.
+        :param returnn_config:
+        :param log_verbosity: RETURNN log verbosity from 1 (least verbose) to 5 (most verbose)
+        :param device: "cpu" or "gpu"
+        :param num_epochs: number of epochs to run, will also set `num_epochs` in the config file.
             Note that this value is NOT HASHED, so that this number can be increased to continue the training.
-        :param int save_interval: save a checkpoint each n-th epoch
-        :param list[int]|set[int]|None keep_epochs: specify which checkpoints are kept, use None for the RETURNN default
+        :param save_interval: save a checkpoint each n-th epoch
+        :param keep_epochs: specify which checkpoints are kept, use None for the RETURNN default
             This will also limit the available output checkpoints to those defined. If you want to specify the keep
             behavior without this limitation, provide `cleanup_old_models/keep` in the post-config and use `None` here.
-        :param int|float time_rqmt:
-        :param int|float mem_rqmt:
-        :param int cpu_rqmt:
-        :param int horovod_num_processes: If used without multi_node_slots, then single node, otherwise multi node.
-        :param int multi_node_slots: multi-node multi-GPU training. See Sisyphus rqmt documentation.
+        :param time_rqmt:
+        :param mem_rqmt:
+        :param cpu_rqmt:
+        :param distributed_launch_cmd: the command used to launch training jobs, only used if horovod_num_processes is not None
+            Possible values: "mpirun": use mpirun, c.f. https://www.open-mpi.org/doc/v4.0/man1/mpirun.1.php
+                             "torchrun": use torchrun, c.f. https://pytorch.org/docs/stable/elastic/run.html
+        :param horovod_num_processes: If used without multi_node_slots, then single node, otherwise multi node.
+        :param multi_node_slots: multi-node multi-GPU training. See Sisyphus rqmt documentation.
             Currently only with Horovod,
             and horovod_num_processes should be set as well, usually to the same value.
             See https://returnn.readthedocs.io/en/latest/advanced/multi_gpu.html.
-        :param Optional[Path] returnn_python_exe: file path to the executable for running returnn (python binary or .sh)
-        :param Optional[Path] returnn_root: file path to the RETURNN repository root folder
+        :param returnn_python_exe: file path to the executable for running returnn (python binary or .sh)
+        :param returnn_root: file path to the RETURNN repository root folder
         """
         assert isinstance(returnn_config, ReturnnConfig)
+        assert distributed_launch_cmd in ["mpirun", "torchrun"]
         self.check_blacklisted_parameters(returnn_config)
         kwargs = locals()
         del kwargs["self"]
 
         self.returnn_python_exe = util.get_returnn_python_exe(returnn_python_exe)
         self.returnn_root = util.get_returnn_root(returnn_root)
+        self.distributed_launch_cmd = distributed_launch_cmd
         self.horovod_num_processes = horovod_num_processes
         self.multi_node_slots = multi_node_slots
         self.returnn_config = ReturnnTrainingJob.create_returnn_config(**kwargs)
@@ -150,22 +189,35 @@ class ReturnnTrainingJob(Job):
         self.out_returnn_config_file = self.output_path("returnn.config")
         self.out_learning_rates = self.output_path("learning_rates")
         self.out_model_dir = self.output_path("models", directory=True)
-        self.out_models = {
-            k: ReturnnModel(
-                self.out_returnn_config_file,
-                self.output_path("models/epoch.%.3d%s" % (k, suffix)),
-                k,
-            )
-            for k in stored_epochs
-            if k in self.keep_epochs
-        }
-        if self.returnn_config.get("use_tensorflow", False):
+        if self.returnn_config.get("use_tensorflow", False) or self.returnn_config.get("backend", None) == "tensorflow":
             self.out_checkpoints = {
                 k: Checkpoint(index_path)
                 for k in stored_epochs
                 if k in self.keep_epochs
                 for index_path in [self.output_path("models/epoch.%.3d.index" % k)]
             }
+
+            # Deprecated, remove when possible
+            self.out_models = {
+                k: ReturnnModel(
+                    self.out_returnn_config_file,
+                    self.output_path("models/epoch.%.3d%s" % (k, suffix)),
+                    k,
+                )
+                for k in stored_epochs
+                if k in self.keep_epochs
+            }
+        elif self.returnn_config.get("backend", None) == "torch":
+            self.out_checkpoints = {
+                k: PtCheckpoint(pt_path)
+                for k in stored_epochs
+                if k in self.keep_epochs
+                for pt_path in [self.output_path("models/epoch.%.3d.pt" % k)]
+            }
+            self.out_models = None
+        else:
+            raise ValueError("'backend' not specified in config")
+
         self.out_plot_se = self.output_path("score_and_error.png")
         self.out_plot_lr = self.output_path("learning_rate.png")
 
@@ -198,25 +250,40 @@ class ReturnnTrainingJob(Job):
         ]
 
         if self.horovod_num_processes:
-            # Normally, if the engine (e.g. SGE or Slurm) is configured correctly,
-            # it automatically provides the information on multiple nodes to mpirun,
-            # so it is not needed to explicitly pass on any hostnames here.
-            run_cmd = [
-                "mpirun",
-                "-np",
-                str(self.horovod_num_processes),
-                "-bind-to",
-                "none",
-                "-map-by",
-                "slot",
-                "-mca",
-                "pml",
-                "ob1",
-                "-mca",
-                "btl",
-                "^openib",
-                "--report-bindings",
-            ] + run_cmd
+            if self.distributed_launch_cmd == "torchrun":
+                # use torchrun to lauch DDP training when the backend is torch
+                # Instead of using the torchrun binary, directly execute the corresponding Python module
+                # and directly use the correct Python environment.
+                prefix = [self.returnn_python_exe.get_path(), "-mtorch.distributed.run"]
+                if (self.multi_node_slots or 1) == 1:
+                    prefix += ["--standalone"]
+                prefix += [
+                    f"--nnodes={self.multi_node_slots or 1}",
+                    f"--nproc-per-node={self.horovod_num_processes}",
+                ]
+                run_cmd = prefix + run_cmd[1:]
+            elif self.distributed_launch_cmd == "mpirun":
+                # Normally, if the engine (e.g. SGE or Slurm) is configured correctly,
+                # it automatically provides the information on multiple nodes to mpirun,
+                # so it is not needed to explicitly pass on any hostnames here.
+                run_cmd = [
+                    "mpirun",
+                    "-np",
+                    str(self.horovod_num_processes),
+                    "-bind-to",
+                    "none",
+                    "-map-by",
+                    "slot",
+                    "-mca",
+                    "pml",
+                    "ob1",
+                    "-mca",
+                    "btl",
+                    "^openib",
+                    "--report-bindings",
+                ] + run_cmd
+            else:
+                raise ValueError(f"invalid distributed_launch_cmd {self.distributed_launch_cmd!r}")
 
         return run_cmd
 
@@ -230,7 +297,12 @@ class ReturnnTrainingJob(Job):
 
             try:
                 with open(file_path, "rt") as file:
-                    return eval(file.read().strip())
+                    return eval(
+                        file.read().strip(),
+                        {"EpochData": EpochData, "nan": float("nan"), "inf": float("inf"), "np": np},
+                    )
+            except FileExistsError:
+                return None
             except FileNotFoundError:
                 return None
 
@@ -309,7 +381,10 @@ class ReturnnTrainingJob(Job):
                         print("Cannot read:", exc)
             sys.stdout.flush()
 
-        sp.check_call(self._get_run_cmd())
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(self.rqmt["cpu"])
+        env["MKL_NUM_THREADS"] = str(self.rqmt["cpu"])
+        sp.check_call(self._get_run_cmd(), env=env)
 
         lrf = self.returnn_config.get("learning_rate_file", "learning_rates")
         self._relink(lrf, self.out_learning_rates.get_path())
@@ -321,7 +396,7 @@ class ReturnnTrainingJob(Job):
         with open(self.out_learning_rates.get_path(), "rt") as f:
             text = f.read()
 
-        data = eval(text)
+        data = eval(text, {"EpochData": EpochData, "nan": float("nan"), "inf": float("inf"), "np": np})
 
         epochs = list(sorted(data.keys()))
         train_score_keys = [k for k in data[epochs[0]]["error"] if k.startswith("train_score")]
@@ -631,7 +706,7 @@ class GetBestEpochJob(Job):
         with open(self.learning_rates.get_path(), "rt") as f:
             text = f.read()
 
-        data = eval(text, {"nan": float("nan"), "inf": float("inf"), "EpochData": EpochData})
+        data = eval(text, {"EpochData": EpochData, "nan": float("nan"), "inf": float("inf"), "np": np})
 
         epochs = list(sorted(data.keys()))
 
@@ -640,7 +715,7 @@ class GetBestEpochJob(Job):
         available_keys = data[epochs[-1]]["error"]
         if self.key not in available_keys:
             raise KeyError(
-                f"{self.key} is not available in the provided learning_rates file f{self.learning_rates.get_path()}"
+                f"{self.key} is not available in the provided learning_rates file {self.learning_rates.get_path()}"
             )
 
         scores = [(epoch, data[epoch]["error"][self.key]) for epoch in epochs if self.key in data[epoch]["error"]]
@@ -754,6 +829,40 @@ class GetBestTFCheckpointJob(GetBestEpochJob):
         )
 
 
+class GetBestPtCheckpointJob(GetBestEpochJob):
+    """
+    Analog to GetBestTFCheckpointJob, just for torch checkpoints.
+    """
+
+    def __init__(self, model_dir: tk.Path, learning_rates: tk.Path, key: str, index: int = 0):
+        """
+
+        :param Path model_dir: model_dir output from a ReturnnTrainingJob
+        :param Path learning_rates: learning_rates output from a ReturnnTrainingJob
+        :param str key: a key from the learning rate file that is used to sort the models
+            e.g. "dev_score_output/output_prob"
+        :param int index: index of the sorted list to access, 0 for the lowest, -1 for the highest score
+        """
+        super().__init__(model_dir, learning_rates, key, index)
+        self.out_checkpoint = PtCheckpoint(self.output_path("checkpoint.pt"))
+
+    def run(self):
+        super().run()
+
+        try:
+            os.link(
+                os.path.join(self.model_dir.get_path(), "epoch.%.3d.pt" % self.out_epoch.get()),
+                self.out_checkpoint.path,
+            )
+        except OSError:
+            # the hardlink will fail when there was an imported job on a different filesystem,
+            # thus do a copy instead then
+            shutil.copy(
+                os.path.join(self.model_dir.get_path(), "epoch.%.3d.pt" % self.out_epoch.get()),
+                self.out_checkpoint.path,
+            )
+
+
 class AverageTFCheckpointsJob(Job):
     """
     Compute the average of multiple specified Tensorflow checkpoints using the tf_avg_checkpoints script from Returnn
@@ -812,3 +921,44 @@ class AverageTFCheckpointsJob(Job):
 
         # The env override is needed if this job is run locally on a node with a GPU installed
         sp.check_call(args, env={"CUDA_VISIBLE_DEVICES": ""})
+
+
+class AverageTorchCheckpointsJob(Job):
+    """
+    average Torch model checkpoints
+    """
+
+    def __init__(
+        self,
+        *,
+        checkpoints: Sequence[Union[tk.Path, PtCheckpoint]],
+        returnn_python_exe: tk.Path,
+        returnn_root: tk.Path,
+    ):
+        """
+        :param checkpoints: input checkpoints
+        :param returnn_python_exe: file path to the executable for running returnn (python binary or .sh)
+        :param returnn_root: file path to the RETURNN repository root folder
+        """
+        self.checkpoints = [ckpt if isinstance(ckpt, PtCheckpoint) else PtCheckpoint(ckpt) for ckpt in checkpoints]
+        self.returnn_python_exe = returnn_python_exe
+        self.returnn_root = returnn_root
+
+        self.out_checkpoint = PtCheckpoint(self.output_path("model/average.pt"))
+
+        self.rqmt = {"cpu": 1, "time": 0.5, "mem": 5}
+
+    def tasks(self):
+        yield Task("run", rqmt=self.rqmt)
+
+    def run(self):
+        os.makedirs(os.path.dirname(self.out_checkpoint.path.get_path()), exist_ok=True)
+        args = [
+            self.returnn_python_exe.get_path(),
+            os.path.join(self.returnn_root.get_path(), "tools/torch_avg_checkpoints.py"),
+            "--checkpoints",
+            *[ckpt.path.get_path() for ckpt in self.checkpoints],
+            "--output_path",
+            self.out_checkpoint.path.get_path(),
+        ]
+        sp.check_call(args)

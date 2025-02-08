@@ -14,12 +14,15 @@ import tempfile
 from typing import Dict, Optional, Union
 
 from sisyphus import *
+from sisyphus.delayed_ops import DelayedBase
 
 Path = setup_path(__package__)
 
 from .flow import linear_segmentation_flow, cached_alignment_flow
 import i6_core.rasr as rasr
 import i6_core.util as util
+
+from i6_core.am.config import get_align_config_and_crp_for_corrected_applicator
 
 
 class MergeMixturesJob(rasr.RasrCommand, Job):
@@ -147,6 +150,8 @@ class MergeMixturesJob(rasr.RasrCommand, Job):
 
 
 class LinearAlignmentJob(MergeMixturesJob):
+    __sis_hash_exclude__ = {"use_corrected_applicator": False}
+
     def __init__(
         self,
         crp,
@@ -158,6 +163,8 @@ class LinearAlignmentJob(MergeMixturesJob):
         minimum_speech_proportion=0.7,
         save_alignment=False,
         keep_accumulators=False,
+        use_corrected_applicator: bool = False,
+        exit_penalty_for_corrected_applicator: float = 0.0,
         extra_merge_args=None,
         extra_config=None,
         extra_post_config=None,
@@ -247,10 +254,21 @@ class LinearAlignmentJob(MergeMixturesJob):
         penalty,
         minimum_speech_proportion,
         save_alignment,
+        use_corrected_applicator,
+        exit_penalty_for_corrected_applicator,
         extra_config,
         extra_post_config,
         **kwargs,
     ):
+        if use_corrected_applicator:
+            crp, _extra_config = get_align_config_and_crp_for_corrected_applicator(
+                crp=crp,
+                exit_penalty=exit_penalty_for_corrected_applicator,
+            )
+            if extra_config is None:
+                extra_config = rasr.RasrConfig()
+            extra_config._update(_extra_config)
+
         segmentation_flow = cls.create_flow(feature_energy_flow, save_alignment)
         mapping = {
             "corpus": "acoustic-model-trainer.corpus",
@@ -497,15 +515,16 @@ class CreateDummyMixturesJob(Job):
         yield Task("run", mini_task=True)
 
     def run(self):
-        num_mixtures = int(self.num_mixtures.get() if isinstance(self.num_mixtures, tk.Variable) else self.num_mixtures)
-        num_features = int(self.num_features.get() if isinstance(self.num_features, tk.Variable) else self.num_features)
+        num_mixtures = int(self.num_mixtures.get() if isinstance(self.num_mixtures, DelayedBase) else self.num_mixtures)
+        num_features = int(self.num_features.get() if isinstance(self.num_features, DelayedBase) else self.num_features)
 
         with open(tk.uncached_path(self.out_mixtures), "wb") as f:
             f.write(b"MIXSET\0\0")
             f.write(struct.pack("II", 2, num_features))
-            args = [1, num_features] + [0.0] * num_features + [1.0]
-            f.write(struct.pack("II%ddd" % num_features, *args))  # mean accumulator
-            f.write(struct.pack("II%ddd" % num_features, *args))  # var  accumulator
+            mean_args = [1, num_features] + [0.0] * num_features + [1.0]  # mean 0.0
+            var_args = [1, num_features] + [1.0] * num_features + [1.0]  # variance 1.0
+            f.write(struct.pack("II%ddd" % num_features, *mean_args))  # mean accumulator
+            f.write(struct.pack("II%ddd" % num_features, *var_args))  # var accumulator
             f.write(struct.pack("IIII", 1, 0, 0, num_mixtures))  # num density + density mean/var idx + num of mixtures
             single_mixture = struct.pack("IId", 1, 0, 1.0)
             for i in range(num_mixtures):

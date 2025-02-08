@@ -118,8 +118,6 @@ class BlissToOggZipJob(Job):
             args.extend(["--no_ogg"])
         elif self.no_conversion:
             args.extend(["--no_conversion"])
-        elif self.ffmpeg_acodec:
-            args.extend(["--ffmpeg_acodec", self.ffmpeg_acodec])
         else:
             if self.rasr_cache is not None:
                 args.extend(["--sprint_cache", tk.uncached_path(self.rasr_cache)])
@@ -127,6 +125,8 @@ class BlissToOggZipJob(Job):
                 args.extend(["--raw_sample_rate", str(self.raw_sample_rate)])
             if self.feat_sample_rate is not None:
                 args.extend(["--feat_sample_rate", str(self.feat_sample_rate)])
+            if self.ffmpeg_acodec:
+                args.extend(["--ffmpeg_acodec", self.ffmpeg_acodec])
 
         sp.check_call(args)
         if self.concurrent == 1:
@@ -138,7 +138,6 @@ class BlissToOggZipJob(Job):
             for zip_subarchive in self.zip_subarchives.hidden_paths.values():
                 with zipfile.ZipFile(zip_subarchive, mode="r", compression=zipfile.ZIP_DEFLATED) as zip_file:
                     zip_file.extractall(tmp_dir)
-                os.remove(zip_subarchive)
 
             # create output folder
             assert self.out_ogg_zip.get().endswith(".zip")
@@ -164,7 +163,7 @@ class BlissToOggZipJob(Job):
                 "-av",
                 os.path.join(
                     tmp_dir,
-                    os.path.basename(self.zip_subarchives.path_template).replace(".$(TASK).zip", ".*/*"),
+                    os.path.basename(self.zip_subarchives.path_template).replace(".$(TASK).zip", ".*/"),
                 ),
                 output_folder,
             ]
@@ -191,7 +190,10 @@ class BlissToOggZipJob(Job):
                         print("Adding:", zip_path)
                         zip_file.write(path, zip_path)
 
+            # move final output and delete single subarchives
             shutil.move(zip_file.filename, self.out_ogg_zip.get())
+            for zip_subarchive in self.zip_subarchives.hidden_paths.values():
+                os.remove(zip_subarchive)
 
     @classmethod
     def hash(cls, parsed_args):

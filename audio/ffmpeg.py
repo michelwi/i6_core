@@ -4,10 +4,10 @@ import copy
 import logging
 import os
 import subprocess
-
-from sisyphus import *
+from typing import List, Optional, Union
 
 from i6_core.lib import corpus
+from sisyphus import Job, Task, tk
 
 
 class BlissFfmpegJob(Job):
@@ -70,40 +70,55 @@ class BlissFfmpegJob(Job):
 
     """
 
+    __sis_hash_exclude__ = {"ffmpeg_input_options": None}
+
     def __init__(
         self,
-        corpus_file,
-        ffmpeg_options=None,
-        recover_duration=True,
-        output_format=None,
-        ffmpeg_binary=None,
-        hash_binary=False,
+        corpus_file: tk.Path,
+        ffmpeg_options: Optional[List[str]] = None,
+        recover_duration: bool = True,
+        output_format: Optional[str] = None,
+        ffmpeg_binary: Optional[Union[str, tk.Path]] = None,
+        hash_binary: bool = False,
+        ffmpeg_input_options: Optional[List[str]] = None,
+        error_threshold: int = 0,
+        cpu_rqmt: int = 5,
     ):
         """
 
-        :param Path corpus_file: bliss corpus
-        :param list(str)|None ffmpeg_options: list of additional ffmpeg parameters
-        :param bool recover_duration: if the filter changes the duration of the audio, set to True
-        :param str output_format: output file ending to determine container format (without dot)
-        :param Path|str|None ffmpeg_binary: path to a ffmpeg binary, uses system "ffmpeg" if None
-        :param bool hash_binary: In some cases it might be required to work with a specific ffmpeg version,
-                                 in which case the binary needs to be hashed
-
+        :param corpus_file: bliss corpus
+        :param ffmpeg_options: list of additional ffmpeg parameters
+        :param recover_duration: if the filter changes the duration of the audio, set to True
+        :param output_format: output file ending to determine container format (without dot)
+        :param ffmpeg_binary: path to a ffmpeg binary, uses system "ffmpeg" if None
+        :param hash_binary: In some cases it might be required to work with a specific ffmpeg version,
+                            in which case the binary needs to be hashed
+        :param ffmpeg_input_options: list of ffmpeg parameters thare are applied for reading the input files
+        :param error_threshold: Allow upto this many files to fail conversion before failing this job
+        :param cpu_rqmt: number of cpu cores to use
         """
         self.corpus_file = corpus_file
+        self.ffmpeg_input_options = ffmpeg_input_options
         self.ffmpeg_options = ffmpeg_options
         self.recover_duration = recover_duration
         self.output_format = output_format
         self.ffmpeg_binary = ffmpeg_binary if ffmpeg_binary else "ffmpeg"
         self.hash_binary = hash_binary
+        self.error_threshold = error_threshold
+        self.num_errors = 0
+        self.failed_files = []
 
         self.out_audio_folder = self.output_path("audio/", directory=True)
         self.out_corpus = self.output_path("corpus.xml.gz")
+        self.out_failed_files = None
+        if self.error_threshold > 0:
+            self.out_failed_files = self.output_path("failed_files.txt")
 
-        self.rqmt = {"time": 4, "cpu": 4, "mem": 8}
+        # e.g. 1 core for python and 4x2 cores for ffmpeg, one for input processing and one for output processing
+        self.rqmt = {"time": 4, "cpu": cpu_rqmt, "mem": 8}
 
     def tasks(self):
-        yield Task("run", resume="run", rqmt=self.rqmt)
+        yield Task("run", rqmt=self.rqmt)
         if self.recover_duration:
             # recovering is not multi-threaded, so force cpu=1
             recover_rqmt = copy.copy(self.rqmt)
@@ -112,11 +127,11 @@ class BlissFfmpegJob(Job):
 
     def run(self):
         c = corpus.Corpus()
-        c.load(tk.uncached_path(self.corpus_file))
+        c.load(self.corpus_file.get_path())
 
         from multiprocessing import pool
 
-        p = pool.Pool(self.rqmt["cpu"])
+        p = pool.Pool(self.rqmt["cpu"] // 2)
         p.map(self._perform_ffmpeg, c.all_recordings())
 
         for r in c.all_recordings():
@@ -126,7 +141,11 @@ class BlissFfmpegJob(Job):
         if self.recover_duration:
             c.dump("temp_corpus.xml.gz")
         else:
-            c.dump(tk.uncached_path(self.out_corpus))
+            c.dump(self.out_corpus.get_path())
+
+        if self.out_failed_files is not None:
+            with open(self.out_failed_files.get_path(), "wt") as out:
+                out.write("\n".join(self.failed_files))
 
     def run_recover_duration(self):
         """
@@ -141,15 +160,17 @@ class BlissFfmpegJob(Job):
 
         for r in c.all_recordings():
             assert len(r.segments) == 1, "needs to be a single segment recording"
-            old_duration = r.segments[0].end
+            segment = r.segments[0]
+            old_duration = segment.end
+            assert r.audio is not None
             data, sample_rate = soundfile.read(open(r.audio, "rb"))
             new_duration = len(data) / sample_rate
-            logging.info("%s: adjusted from %f to %f seconds" % (r.segments[0].name, old_duration, new_duration))
-            r.segments[0].end = new_duration
+            logging.info(f"{segment.name}: adjusted from {old_duration} to {new_duration} seconds")
+            segment.end = new_duration
 
         c.dump(self.out_corpus.get_path())
 
-    def _get_output_filename(self, recording):
+    def _get_output_filename(self, recording: corpus.Recording):
         """
         returns a new audio filename with a potentially
         changed file ending based on "output_format"
@@ -158,13 +179,14 @@ class BlissFfmpegJob(Job):
         :return:
         :rtype str
         """
+        assert recording.audio is not None
         audio_filename = os.path.basename(recording.audio)
         if self.output_format is not None:
-            name, ext = os.path.splitext(audio_filename)
+            name, _ = os.path.splitext(audio_filename)
             audio_filename = name + "." + self.output_format
         return audio_filename
 
-    def _perform_ffmpeg(self, recording):
+    def _perform_ffmpeg(self, recording: corpus.Recording):
         """
         Build and call an FFMPEG command to apply on a recording
 
@@ -175,26 +197,31 @@ class BlissFfmpegJob(Job):
 
         target = os.path.join(self.out_audio_folder.get_path(), audio_filename)
         if not os.path.exists(target):
-            logging.info("try converting %s" % target)
-            command_head = [
-                self.ffmpeg_binary,
-                "-hide_banner",
-                "-y",
-                "-i",
-                recording.audio,
-            ]
-            command_tail = [os.path.join(self.out_audio_folder.get_path(), audio_filename)]
-            if self.ffmpeg_options is None or len(self.ffmpeg_options) == 0:
-                command = command_head + command_tail
-            else:
-                command = command_head + self.ffmpeg_options + command_tail
-            subprocess.check_call(command)
+            logging.info(f"try converting {target}")
+            command_head = [self.ffmpeg_binary, "-hide_banner", "-y", "-threads", "1"]
+            command_in = ["-i", recording.audio]
+            command_out = ["-threads", "1", target]
+            in_options = self.ffmpeg_input_options or []
+            out_options = self.ffmpeg_options or []
+            command = command_head + in_options + command_in + out_options + command_out
+            ret = subprocess.run(command, check=False)
+            if ret.returncode != 0:
+                self.num_errors += 1
+                os.remove(target)
+                self.failed_files.append(recording.audio)
+            if self.num_errors > self.error_threshold:
+                with open(self.out_failed_files.get_path(), "wt") as out:
+                    out.write("\n".join(self.failed_files))
+                raise subprocess.SubprocessError("Error threshold exceeded")
         else:
-            logging.info("skipped existing %s" % target)
+            logging.info(f"skipped existing {target}")
 
     @classmethod
     def hash(cls, kwargs):
         d = copy.copy(kwargs)
         if not kwargs["hash_binary"]:
             d.pop("ffmpeg_binary")
+        if kwargs["error_threshold"] == 0:
+            d.pop("error_threshold")
+        d.pop("cpu_rqmt")
         return super().hash(d)

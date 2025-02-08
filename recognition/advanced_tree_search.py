@@ -13,6 +13,7 @@ Path = setup_path(__package__)
 import math
 import os
 import shutil
+from typing import Any, Dict, Optional
 
 import i6_core.lm as lm
 import i6_core.rasr as rasr
@@ -150,25 +151,50 @@ class AdvancedTreeSearchLmImageAndGlobalCacheJob(rasr.RasrCommand, Job):
 class AdvancedTreeSearchJob(rasr.RasrCommand, Job):
     def __init__(
         self,
-        crp,
-        feature_flow,
-        feature_scorer,
-        search_parameters=None,
-        lm_lookahead=True,
-        lookahead_options=None,
-        create_lattice=True,
-        eval_single_best=True,
-        eval_best_in_lattice=True,
-        use_gpu=False,
-        rtf=10,
-        mem=4,
-        cpu=1,
-        lmgc_mem=12,
-        model_combination_config=None,
-        model_combination_post_config=None,
-        extra_config=None,
-        extra_post_config=None,
+        crp: rasr.CommonRasrParameters,
+        feature_flow: rasr.FlowNetwork,
+        feature_scorer: rasr.FeatureScorer,
+        search_parameters: Optional[Dict[str, Any]] = None,
+        lm_lookahead: bool = True,
+        lookahead_options: Optional[Dict[str, Any]] = None,
+        create_lattice: bool = True,
+        eval_single_best: bool = True,
+        eval_best_in_lattice: bool = True,
+        use_gpu: bool = False,
+        rtf: float = 10.0,
+        mem: float = 4.0,
+        cpu: int = 1,
+        lmgc_mem: float = 12.0,
+        lmgc_alias: Optional[str] = None,
+        lmgc_scorer: Optional[rasr.FeatureScorer] = None,
+        model_combination_config: Optional[rasr.RasrConfig] = None,
+        model_combination_post_config: Optional[rasr.RasrConfig] = None,
+        extra_config: Optional[rasr.RasrConfig] = None,
+        extra_post_config: Optional[rasr.RasrConfig] = None,
     ):
+        """
+
+        :param crp: Common Rasr parameters for recognition
+        :param feature_flow: Flow network for recognition
+        :param feature_scorer: Feature scorer used in recognition. For AdvancedTreeSearchLmImageAndGlobalCacheJob RASR requires setting the feature scorer while actually not using it.
+        :param search_parameters: Parameters for search e.g. beam-pruning, uses defaults defined below if not set
+        :param lm_lookahead: Whether to perform language model lookahead or not
+        :param lookahead_options: Options for the lm lookahead
+        :param create_lattice: Recognizer option to produde lattices. Stored as FST
+        :param eval_single_best: Extract the best path from the lattice
+        :param eval_best_in_lattice:
+        :param use_gpu: Flag to enable GPU decoding
+        :param rtf: Expected rtf value to predict time requirement for the job
+        :param mem: Memory requirement for the job
+        :param cpu: CPU requirement for the job
+        :param lmgc_mem: Memory requirement for the AdvancedTreeSearchLmImageAndGlobalCacheJob
+        :param lmgc_alias: Alias for the AdvancedTreeSearchLmImageAndGlobalCacheJob
+        :param lmgc_scorer: Dummy scorer for the AdvancedTreeSearchLmImageAndGlobalCacheJob which is required but unused
+        :param model_combination_config: Configuration for model combination
+        :param model_combination_post_config: Post config for model combination
+        :param extra_config: Additional Config for recognition
+        :param extra_post_config: Post config of additional config for recognition
+        """
         assert isinstance(feature_scorer, rasr.FeatureScorer)
 
         self.set_vis_name("Advanced Beam Search")
@@ -213,7 +239,7 @@ class AdvancedTreeSearchJob(rasr.RasrCommand, Job):
         self.feature_flow.write_to_file("feature.flow")
         util.write_paths_to_file(self.out_lattice_bundle, self.out_single_lattice_caches.values())
         extra_code = "export OMP_NUM_THREADS={0}\nexport TF_DEVICE='{1}'".format(
-            math.ceil(self.cpu / 2), "gpu" if self.use_gpu else "cpu"
+            math.ceil(self.cpu), "gpu" if self.use_gpu else "cpu"
         )
         self.write_run_script(self.exe, "recognition.config", extra_code=extra_code)
 
@@ -246,25 +272,31 @@ class AdvancedTreeSearchJob(rasr.RasrCommand, Job):
     @classmethod
     def create_config(
         cls,
-        crp,
-        feature_flow,
-        feature_scorer,
-        search_parameters,
-        lm_lookahead,
-        lookahead_options,
-        create_lattice,
-        eval_single_best,
-        eval_best_in_lattice,
-        mem,
-        cpu,
-        lmgc_mem,
-        model_combination_config,
-        model_combination_post_config,
-        extra_config,
-        extra_post_config,
+        crp: rasr.CommonRasrParameters,
+        feature_flow: rasr.FlowNetwork,
+        feature_scorer: rasr.FeatureScorer,
+        search_parameters: Optional[Dict[str, Any]],
+        lm_lookahead: bool,
+        lookahead_options: Optional[Dict[str, Any]],
+        create_lattice: bool,
+        eval_single_best: bool,
+        eval_best_in_lattice: bool,
+        mem: float,
+        cpu: int,
+        lmgc_mem: float,
+        lmgc_alias: Optional[str],
+        lmgc_scorer: Optional[rasr.FeatureScorer],
+        model_combination_config: Optional[rasr.RasrConfig],
+        model_combination_post_config: Optional[rasr.RasrConfig],
+        extra_config: Optional[rasr.RasrConfig],
+        extra_post_config: Optional[rasr.RasrConfig],
         **kwargs,
     ):
-        lm_gc = AdvancedTreeSearchLmImageAndGlobalCacheJob(crp, feature_scorer, extra_config, extra_post_config)
+        lm_gc = AdvancedTreeSearchLmImageAndGlobalCacheJob(
+            crp, lmgc_scorer if lmgc_scorer is not None else feature_scorer, extra_config, extra_post_config
+        )
+        if lmgc_alias is not None:
+            lm_gc.add_alias(lmgc_alias)
         lm_gc.rqmt["mem"] = lmgc_mem
 
         search_parameters = cls.update_search_parameters(search_parameters)

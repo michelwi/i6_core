@@ -4,6 +4,7 @@ __all__ = [
     "NamedFlowAttribute",
     "FlagDependentFlowAttribute",
     "PathWithPrefixFlowAttribute",
+    "WriteFlowNetworkJob",
 ]
 
 import collections
@@ -12,6 +13,7 @@ import itertools as it
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
 
+from sisyphus import Job, Task
 from sisyphus.tools import extract_paths
 
 from .config import RasrConfig
@@ -235,10 +237,12 @@ class FlowNetwork:
 
         # now add all the links
         for l in internal_links:
-            name_in = l[0].split(":")[0]
-            name_out = l[1].split(":")[0]
+            split_in = l[0].split(":")
+            split_out = l[1].split(":")
+            name_in = split_in[0]
+            name_out = split_out[0]
             if name_in in processed_nodes:
-                net.link(mapping[l[0]], mapping[l[1]])
+                net.link(":".join([mapping[name_in]] + split_in[1:]), ":".join([mapping[name_out]] + split_out[1:]))
             elif name_out in processed_nodes:
                 broken_links.append((l[0], mapping[l[1]]))
 
@@ -368,7 +372,7 @@ class FlowNetwork:
             "params": self.params,
             "hidden_inputs": self.hidden_inputs,
             "config": self.config,
-            "post_config": self.post_config,
+            "post_config": None,
         }
         return state
 
@@ -409,3 +413,23 @@ def _smart_union(s, e):
     if type(e) == list or type(e) == set:
         return s.union(e)
     return s.union([e])
+
+
+class WriteFlowNetworkJob(Job):
+    """
+    Writes a flow network to a file
+    """
+
+    def __init__(
+        self,
+        flow: FlowNetwork,
+    ):
+        self.flow = flow
+
+        self.out_flow_file = self.output_path("network.flow")
+
+    def tasks(self):
+        yield Task("run", mini_task=True)
+
+    def run(self):
+        self.flow.write_to_file(self.out_flow_file.get_path())
